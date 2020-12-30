@@ -1,12 +1,14 @@
 # built in
 import time
 import datetime
-# import sys
 import threading
 import queue
 
 # 3rd party
 import pytz
+
+# custom
+import commons
 
 # IB API
 from ibapi.client import EClient
@@ -30,7 +32,7 @@ class IBAPIWrapper(EWrapper):
     def error(self, id, errorCode, errorString):
         """ Formats the error messages coming from TWS. """
         error_message = f"IB Error ID ({id}), Error Code ({errorCode}) with response '{errorString}'"
-        print(error_message)
+        self.log.debug(error_message)
 
     def currentTime(self, server_time):
         """
@@ -38,16 +40,16 @@ class IBAPIWrapper(EWrapper):
         of reqCurrentTime.
         """
         server_time = datetime.datetime.utcfromtimestamp(server_time).strftime('%Y-%m-%d %H:%M:%S')
-        print(f'Current server time is: {server_time}')
+        self.log.debug(f'Current server time is: {server_time}')
 
     def contractDetails(self, reqId, contractDetails):
-        print(f"[reqId:{reqId}] Contract details: {contractDetails}")
+        self.log.debug(f"[reqId:{reqId}] Contract details: {contractDetails}")
         # TODO: missing overload for contractDetailsEnd method
 
     def tickPrice(self, reqId, tickType, price, attrib):
         symbol = self._reqDetails[reqId]['symbol']
         tickType_name = TickTypeEnum.to_str(tickType)
-        print(f"[reqId: {reqId}], symbol:{symbol}, tickType: {tickType_name}({tickType}), Value: {price}")
+        self.log.debug(f"[reqId: {reqId}], symbol:{symbol}, tickType: {tickType_name}({tickType}), Value: {price}")
         self._market_data_queues[reqId].put({
             'Symbol': symbol,
             'TickTypeName': tickType_name,
@@ -56,20 +58,21 @@ class IBAPIWrapper(EWrapper):
         })
 
     def tickSnapshotEnd(self, tickerId: int):
-        print(f'Finished getting market data for reqId:{tickerId}')
+        self.log.debug(f'Finished getting market data for reqId:{tickerId}')
         self._market_data_queues[tickerId].put(self.FINISHED)
 
     def updatePortfolio(self, contract:Contract, position:float, marketPrice:float, marketValue:float,
                         averageCost:float, unrealizedPNL:float, realizedPNL:float, accountName:str):
         str_msg = (
-            f"[updatePortfolio] Symbol: {contract.symbol}, Position: {position}, Market Price: {marketPrice}, "
-            f"Market Value: {marketValue} Average Cost: {averageCost}, Unrealized PNL: {unrealizedPNL}, "
-            f"Realized PNL: {realizedPNL}"
+            f"[updatePortfolio] Symbol: {contract.symbol} ({contract.secType}), Position: {position}, "
+            f"Market Price: {marketPrice}, Market Value: {marketValue} Average Cost: {averageCost}, "
+            f"Unrealized PNL: {unrealizedPNL}, Realized PNL: {realizedPNL}"
         )
-        print(str_msg)
+        self.log.debug(str_msg)
         self._portfolio_details.put({
             'key': 'Position',
             'symbol': contract.symbol,
+            'contractType': contract.secType,
             'positionCnt': position,
             'marketPrice': marketPrice,
             'marketValue': marketValue,
@@ -82,7 +85,7 @@ class IBAPIWrapper(EWrapper):
         """
         https://interactivebrokers.github.io/tws-api/interfaceIBApi_1_1EWrapper.html#ae15a34084d9f26f279abd0bdeab1b9b5
         """
-        print(f"[updateAccountValue] Key: {key}, Value: {val}, Currency: {currency}, Account Name: {accountName}")
+        self.log.debug(f"[updateAccountValue] Key: {key}, Value: {val}, Currency: {currency}, Account Name: {accountName}")
         self._portfolio_details.put({
             'key': key,
             'val': val,
@@ -90,10 +93,10 @@ class IBAPIWrapper(EWrapper):
         })
 
     def updateAccountTime(self, timeStamp:str):
-        print(f"[updateAccountTime] Time: {timeStamp}")
+        self.log.debug(f"[updateAccountTime] Time: {timeStamp}")
 
     def accountDownloadEnd(self, accountName: str):
-        print('Got all Account Updates!')
+        self.log.debug('Got all Account Updates!')
         self._portfolio_details.put(self.FINISHED)
 
     def orderStatus(self, orderId:int , status:str, filled:float, remaining:float, avgFillPrice:float, permId:int,
@@ -105,7 +108,7 @@ class IBAPIWrapper(EWrapper):
             f"[orderStatus] orderId: {orderId}, Status: {status}, Filled: {filled}, "
             f"Remaining: {remaining}, Last Fill Price: {lastFillPrice}"
         )
-        print(str_msg)
+        self.log.debug(str_msg)
         self._orders_queue.put({
             'callback': 'orderStatus',
             'orderId': orderId,
@@ -123,7 +126,7 @@ class IBAPIWrapper(EWrapper):
             f"[openOrder] orderId: {orderId}, Symbol: {contract.symbol}, {contract.secType} at {contract.exchange}: "
             f"{order.action}, {order.orderType}, {order.totalQuantity}. Order state: {orderState.status}"
         )
-        print(str_msg)
+        self.log.debug(str_msg)
         self._orders_queue.put({
             'callback': 'openOrder',
             'orderId': orderId,
@@ -136,7 +139,7 @@ class IBAPIWrapper(EWrapper):
         })
 
     def openOrderEnd(self):
-        print('Got all callbacks from openOrder!')
+        self.log.debug('Got all callbacks from openOrder!')
         self._orders_queue.put(self.FINISHED)
 
     def execDetails(self, reqId:int, contract:Contract, execution:Execution):
@@ -148,8 +151,8 @@ class IBAPIWrapper(EWrapper):
             f"execId: {execution.execId}, orderId: {execution.orderId}, Shares: {execution.shares}, "
             f"Last Liquidity: {execution.lastLiquidity}"
         )
-        print(str_msg)
-        # TODO: implement
+        self.log.debug(str_msg)
+        # TODO: implement putting things into the queue
         pass
 
     def execDetailsEnd(self, reqId:int):
@@ -167,13 +170,15 @@ class IBAPIApp(IBAPIWrapper, EClient):
     clientId : `int`
         An (arbitrary) client ID, that must be a positive integer
     """
-    def __init__(self, port=None, clientId=None):
+    def __init__(self, port=None, clientId=None, debug=True, logger=None):
         """
         currencies: iterable
             Iterable with currencies codes that should be considered by API
         base_currency: str
             Currency code for base currency
         """
+        self.log = commons.setup_logging(logger=logger, debug=debug)
+
         IBAPIWrapper.__init__(self)
         EClient.__init__(self, wrapper=self)
         self.nextValidOrderId = None
@@ -265,6 +270,9 @@ class IBAPIApp(IBAPIWrapper, EClient):
             2: "Frozen", like 1, but after sessions is closed
             3: "Delayed", if user does not have subscritpion for instruments where it is required
             4: "Deleyed-Frozen", like 3, but after sesssion is closed
+
+        tickTypes : 'str', comma delimited
+            https://interactivebrokers.github.io/tws-api/tick_types.html
         """
         now = datetime.datetime.now(pytz.timezone('Europe/London'))
         dow =  now.weekday() # 0-Monday, 6-Sunday
@@ -278,7 +286,7 @@ class IBAPIApp(IBAPIWrapper, EClient):
         self.reqMarketDataType(MarketDataType)
         # send request
         symbol = contract.symbol
-        print(f'Requesting market data for: {symbol}')
+        self.log.debug(f'Requesting market data for: {symbol}')
         reqId = self.get_reqId()
         self._market_data_queues[reqId] = queue.Queue()
         self._set_req_details(reqId, 'reqMktData', symbol, now)
@@ -299,7 +307,7 @@ class IBAPIApp(IBAPIWrapper, EClient):
                     _output[msg['TickTypeName'].replace('DELAYED_', '')] = msg['Price']
             t_cur = datetime.datetime.now()
             if (t_cur - t_start).seconds > timeout:
-                print(f'Timed out from getting {symbol} market data')
+                self.log.debug(f'Timed out from getting {symbol} market data')
                 return None
         return _output
 
@@ -326,10 +334,11 @@ class IBAPIApp(IBAPIWrapper, EClient):
                         'marketValue': msg['marketValue'],
                         'averageCost': msg['averageCost'],
                         'unrealizedPNL': msg['unrealizedPNL'],
+                        'contractType': msg['contractType'],
                     }
             t_cur = datetime.datetime.now()
             if (t_cur - t_start).seconds > timeout:
-                print('Timed out from getting portfolio details')
+                self.log.debug('Timed out from getting portfolio details')
                 return None
         return _output
 
@@ -362,7 +371,7 @@ class IBAPIApp(IBAPIWrapper, EClient):
                     _orders[orderId]['lastFillPrice'] = msg['lastFillPrice']
             t_cur = datetime.datetime.now()
             if (t_cur - t_start).seconds > timeout:
-                print('Timed out from getting current orders')
+                self.log.debug('Timed out from getting current orders')
                 return None
         _orders['orders'] = sorted(list(_orderIds))
         _orders['symbols'] = sorted(list(_symbols))
@@ -380,11 +389,14 @@ class IBAPIApp(IBAPIWrapper, EClient):
         }
 
 
-def main():
+def main(test_orders=False, debug=True):
+    PORT = 7497
+
     print("Launching IB API application...")
     app = IBAPIApp(
-        port=7497,
+        port=PORT,
         clientId=666,
+        debug=debug
     )
     print("Successfully launched IB API application...")
 
@@ -400,7 +412,7 @@ def main():
         app.reqContractDetails(app.get_reqId(), ctr)
         time.sleep(1)
         # Get price data
-        mkt_data = app.get_current_price(contract=ctr, timeout=3)
+        mkt_data = app.get_current_price(contract=ctr, timeout=3, tickTypes='66,67,75,68,72,73,74,76')
         print(f"{symbol} market data: {mkt_data}")
         time.sleep(2)
 
@@ -408,56 +420,49 @@ def main():
     portfolio_details = app.get_portfolio_details()
     print(f'Portfolio details: {portfolio_details}')
 
-    # Place order
-    # print('Placing Adaptive Order')
-    # adaptive_order = app.create_order(
-    #     action='BUY', quantity=10, orderType='MKT', adaptive=True, adaptivePriority='Patient'
-    # )
-    # app.placeOrder(
-    #     app.nextOrderId(),  # orderId
-    #     contracts['ADM'],   # Contract
-    #     adaptive_order,     # Order
-    # )
-
-    # print('Place SL order')
-    # sl_order = app.create_order(
-    #     action='SELL', quantity=10, orderType='TRAIL', trailingPercent=1
-    # )
-    # app.placeOrder(
-    #     app.nextOrderId(),  # orderId
-    #     contracts['ADM'],   # Contract
-    #     sl_order,           # Order
-    # )
-
+    if test_orders == True:
+        if PORT != 7497:
+            raise ValueError('Aborting. Port is different than default for paper trading account!')
+        # Adaptive
+        print('Placing Adaptive Order')
+        adaptive_order = app.create_order(
+            action='BUY', quantity=10, orderType='MKT', adaptive=True, adaptivePriority='Patient'
+        )
+        app.placeOrder(
+            app.nextOrderId(),  # orderId
+            contracts['ADM'],   # Contract
+            adaptive_order,     # Order
+        )
+        # Trailing Stop Loss
+        print('Place SL order')
+        sl_order = app.create_order(
+            action='SELL', quantity=10, orderType='TRAIL', trailingPercent=1
+        )
+        app.placeOrder(
+            app.nextOrderId(),  # orderId
+            contracts['ADM'],   # Contract
+            sl_order,           # Order
+        )
+    time.sleep(1)
     print('Getting current orders...')
     current_orders = app.get_current_orders()
     print('current_orders: ', current_orders)
 
     # Disconnect and finish execution
-    # time.sleep(5)
-    # app.disconnect()
-    # print("Disconnected from the IB API application. Finished.")
+    time.sleep(5)
+    app.disconnect()
+    print("Disconnected from the IB API application. Finished.")
+
 
 if __name__ == '__main__':
-    main()
-
-"""
-TODOs:
-OK - v0 to do get price and details with prints only
-OK - properly get portfolio details
-OK - properly get market price
-OK - place basic order
-OK - place SL order
-OK - get orders status
-- should I wrap placing orders? so e.g. it is assured to be use correct orderId etc?
-
-
-Useful tutorials for Python API:
-- https://www.youtube.com/playlist?list=PL71vNXrERKUpPreMb3z1WGx6fOTCzMaH1
-- https://www.quantstart.com/articles/connecting-to-the-interactive-brokers-native-python-api/
-- https://algotrading101.com/learn/interactive-brokers-python-api-native-guide/
-
-"""
-
-
-
+    parser = commons.get_parser()
+    parser.add_argument(
+        '--test_orders', '-to',
+        action='store_true', 
+        help='flag to run placing orders',
+    )
+    args = parser.parse_known_args()[0]
+    main(
+        test_orders=args.test_orders,
+        debug=args.debug,
+    )
