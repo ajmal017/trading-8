@@ -16,6 +16,7 @@ from strategies.strategy_4 import long_only_s4_config
 import strategies.helpers as helpers
 from ib_api import IBAPIApp
 from ftse_symbols import ftse_100_to_ib_map
+from position_size import FixedRisk
 
 
 class TradingExecutor():
@@ -24,19 +25,26 @@ class TradingExecutor():
     very specific trading strategy:
         - long only
         - stocks only
-        - in GBP
+        - in GBX (1/100 of GBP)
         - predefined universe
         - LSE and trading hours
+        - fixed stop loss %
+        - predefined postion sizing
+        - you can not buy same symbol (order more shares of sth you alredy own)
         - etc.
     """
     def __init__(self, pricing_data_path='./pricing_data', load_csv=False, logger=None, debug=False, 
-                 signal_config=None, signal_lookback=None, ib_port=None, ib_client=666):
+                 signal_config=None, signal_lookback=None, ib_port=None, ib_client=666, stop_loss_perc=1.5,
+                 position_sizer=None):
         self.today = str(self._now().date())
         self.log = commons.setup_logging(logger=logger, debug=debug)
         self.pricing_data_path = pricing_data_path
         self.load_csv = load_csv
         self.signal_config = signal_config
         self.signal_lookback = signal_lookback
+        self.stop_loss_perc = stop_loss_perc/100.0  # `stop_loss_perc` is in %, i.e. 1% -> 1
+        self.position_sizer = position_sizer
+        self._to_set_stop_loss = []
         # start IB App
         self.ib_app = IBAPIApp(
             port=ib_port,
@@ -45,6 +53,28 @@ class TradingExecutor():
         self._check_ib_env()
 
     def trade(self, ignore_xe_check=False, ignore_tod_check=False, ignore_sa_check=False):
+        """
+        High-level flow:
+        - Run checks:
+            - is exchange open? 
+            - what time is it? - it should start execution ~1-2h before closing
+        - Initialize session:
+            - download/get pricing data
+            - run signal generation
+            - get current account status: money and what you currently hold
+        - More checks:
+            - are generated signals up to date?
+        - Gather entry/exit signals -> lists of things to buy and sell
+        - Place and monitor orders until everything is sold and bought
+            - see _place_and_monitor_sell_buy for more details
+        - Exit
+            - This will be changed later.
+        - Generates signals again with more up to date data from investpy?
+            - This is open question. Not sure if it makes sense right now
+        - Do things after session is closed
+            - Set protective stop loss orders
+            - [P3] Cancel not filled buy orders
+        """
         # Check if exchange is open
         if ignore_xe_check == False:
             exchange_is_open = self.check_if_trade_open()
@@ -84,49 +114,40 @@ class TradingExecutor():
             )
 
         # Gather buy/sell signals
-        # to_sell, buy_candidates = self._gather_buy_sell_signals(last_signals_ds)
-        to_sell, buy_candidates = self._gather_buy_sell_signals('2020-12-30')
-
-        # Place sell orders for held symbols that should be closed
-        self._execute_exit_signals(to_sell)
-
+        to_sell, buy_candidates = self._gather_buy_sell_signals(last_signals_ds)
+        self.log.debug(f'Got exit signals from following symbols: {to_sell}')
+        self.log.debug(f'Buying candidates: {buy_candidates}')
         # Run position sizer to decide what to buy
         # NOTE: at this moment closing position orders are (most-probably) not yet filled
         # available money are not yet updated. so buying can be based on smaller amount here
-        self.log.debug(f'Buying candidates: {buy_candidates}')
-        # ...
+        to_buy = self.position_sizer.decide_what_to_buy(
+            self.available_cash,
+            buy_candidates,
+            volatility={
+                c['symbol']: self.signals[c['symbol']]['volatility'][last_signals_ds] 
+                for c in buy_candidates
+            }
+        )
+        self.log.debug(f'Symbols/shares to buy based on position sizing: {to_buy}')
 
+        # Place and monitor orders until everything is sold and bought
+        while (len(to_sell) != 0) or (len(to_buy) != 0):
+            self.log.debug(
+                f'Enter `_place_and_monitor_sell_buy` with to_buy: {to_buy} and to_sell: {to_sell}'
+            )
+            to_buy, to_sell = self._place_and_monitor_sell_buy(
+                to_buy, to_sell, buy_candidates, last_signals_ds
+            )
 
-        """
-        High-level flow:
-        - do things at the end of the session. e.g. 1-2h before closing
-        - take data near end of the session as full data
-        - this is closest thing to backtest scenario
-        - risk of not filling orders... but it can be mitigated with limits etc.
-        - flow would be:
-            -> start at fixed hour of trading session (e.g. 1-2 before closing a session):
-                - check all the things to sell
-                - place sell orders
-                - check all the things to buy
-                - run position sizer to determine what to buy
-                - place (lmt) buy and stop loss orders
-            -> after session is closed:
-                - cancel not filled buy orders (lost opportunity. happens.)
-                - send an alert to me in case there is open sell order (any kind) that
-                  should be filled but it's not
+        # Wait until session is closed to place protective orders at a close price
+        while (self._now().hour < 16) and (self._now().minute < 30):
+            time.sleep(60*5)
+            self.log.debug(f'Waiting for session to close (16:30). Now is: {self._now()}')
+        self._place_protective_orders()
 
-        Questions:
-        1.
-            What about money that I got from sell? Right now I just sequentially plan to send
-            sell and buy order. That means I will have less money for buying things...
-
-            After orders are out one should probablyt monitor order execution and continue to
-            buy things as sell orders are filled..
-
-        2.
-            Closing positions should also be repeated probably... so that if along with time
-            new symbol joins to_sell pool they are also included
-        """
+        # Close trading
+        self.log.debug(f'All thing are now sold and bough - trading finished.')
+        return
 
     def start_session(self):
         self.log.debug('Starting session!')
@@ -135,21 +156,22 @@ class TradingExecutor():
         self.signals = self._prepare_signals()
         self.log.debug('All signals ready')
         self.account_details = self.get_account_details()
-        self.log.debug(
-            'Initial account details ready: '
-            f'available_cash: {self.available_cash}, hold_symbols: {self.hold_symbols}, '
-            f'positions_cnts: {self.positions_cnts}',
-        )
 
     def get_account_details(self):
         portfolio_details = self.ib_app.get_portfolio_details()
-        self.available_cash = portfolio_details['TotalCashBalance_GBP']
+        # NOTE: available_cash is converted into GBX, that is 1/100 GBP
+        self.available_cash = float(portfolio_details['TotalCashBalance_GBP']) * 100
         self.hold_symbols = []
         self.positions_cnts = {}
         for symbol, details in portfolio_details['positions'].items():
-            if details['contractType'] == 'STK':
+            if (details['contractType'] == 'STK') and (details['positionCnt'] > 0):
                 self.hold_symbols.append(symbol)
-                self.positions_cnts[symbol] = portfolio_details['positions'][symbol]['positionCnt']
+                self.positions_cnts[symbol] = int(portfolio_details['positions'][symbol]['positionCnt'])
+        self.log.debug(
+            'Account details ready: '
+            f'available_cash: {self.available_cash}, hold_symbols: {self.hold_symbols}, '
+            f'positions_cnts: {self.positions_cnts}',
+        )
         return portfolio_details
 
     def check_if_trade_open(self):
@@ -187,7 +209,7 @@ class TradingExecutor():
         if hour < 8:
             self.log.debug("Trading session is closed: LSE is opens at 8am")
             return False
-        if hour > 16 and now.minute > 30:
+        if hour >= 16 and now.minute > 30:
             self.log.debug("Trading session is closed: LSE is closes at 4:30pm")
             return False
         # session is open
@@ -238,9 +260,13 @@ class TradingExecutor():
             )
         else:
             universe = lse_data.load(symbols=symbols)
-        # translate FTSE symbols to its representation in IB (e.g. ADML == ADM)
         translated_universe = {}
-        for sym in universe.keys():
+        for sym, df in universe.items():
+            # calculate volatility if it does not exists. assuming 14 days rolling period 
+            if 'volatility' not in df.columns:
+                df.loc[:, 'volatility'] = df['close'].shift().rolling(14).std()
+                df['volatility'].fillna(0, inplace=True)
+            # translate FTSE symbols to its representation in IB (e.g. ADML == ADM)
             ib_symbol = ftse_100_to_ib_map[sym]
             translated_universe[ib_symbol] = universe[sym]
         return translated_universe
@@ -270,27 +296,181 @@ class TradingExecutor():
             if (sym_cur_data['position'] == 0) or (sym_cur_data['exit_long'] == 1):
                 to_sell.append(symbol)
             elif sym_cur_data['entry_long'] == 1:
-                buy_candidates.append(symbol)
+                # note: close is not actual close here. its latest price from investpy dowloaded data
+                approx_close = sym_cur_data['close']
+                # this stop loss will be used only in position sizer. not as an input into order
+                approx_sl = approx_close - (approx_close * self.stop_loss_perc)
+                buy_candidates.append(
+                    self.position_sizer.define_candidate(
+                        symbol=symbol, entry_type='long', price=approx_close, stop_loss=approx_sl
+                    )
+                )
         return to_sell, buy_candidates
 
-    def _execute_exit_signals(self, to_sell):
-        self.log.debug(f'Got exit signals from following symbols: {to_sell}')
+    def _execute_exit_signals(self, to_sell, to_cancel):
         held_for_sell = [
             symbol for symbol in to_sell if symbol in self.hold_symbols
         ]
-        self.log.debug(f'Those are hold symbols that should be sold: {held_for_sell}')
+        self.log.debug(f'Will close positions for following symbols: {held_for_sell}')
         for symbol in held_for_sell:
             contract = self.ib_app.get_contract(symbol=symbol)
             # it will be Adaptive Market Order with Normal priority
-            share_cnt = self.positions_cnts[symbol]
+            shares_cnt = self.positions_cnts[symbol]
             order = self.ib_app.create_order(
                 action='SELL',
-                quantity=share_cnt,
+                quantity=shares_cnt,
                 orderType='MKT',
-                adaptive=True
+                adaptive=True,
+                tif='DAY'
             )
             self.ib_app.placeOrder(self.ib_app.nextOrderId(), contract, order)
-            self.log.debug(f'Placed SELL order for {share_cnt} shares of {symbol}')
+            self.log.debug(f'Placed SELL order for {shares_cnt} shares of {symbol}')
+        self.log.debug(f'Will cancel following protective orders: {list(to_cancel.items())}')
+        for orderId, symbol in to_cancel.items():
+            self.ib_app.cancelOrder(orderId)
+            self.log.debug(f'Cancelled {shares_cnt} ({symbol})')
+
+    def _execute_entry_signals(self, to_buy):
+        self.log.debug(f"Will open positions for following symbols: {[tb['symbol'] for tb in to_buy]}")
+        for candidate in to_buy:
+            symbol = candidate['symbol']
+            if symbol in self.hold_symbols:
+                self.log.debug((
+                    f"Skipping placing order for {symbol} as it is already bought. "
+                    'You cannot place BUY order for symbols you already own'
+                ))
+                continue
+            contract = self.ib_app.get_contract(symbol=symbol)
+            shares_cnt = candidate['shares_count']
+            # Adaptive Limit Order with Normal priority
+            buy_order = self.ib_app.create_order(
+                action='BUY',
+                quantity=shares_cnt,
+                orderType='MKT',
+                adaptive=True,
+                tif='DAY'
+            )
+            self.ib_app.placeOrder(self.ib_app.nextOrderId(), contract, buy_order)
+            self.log.debug(f'Placed BUY order for {shares_cnt} shares of {symbol}')
+            self._to_set_stop_loss.append({
+                'symbol': symbol, 'cnt': shares_cnt
+            })
+
+    def _place_protective_orders(self):
+        self.log.debug(
+            f"Stop Loss orders execution: {[s['symbol'] for s in self._to_set_stop_loss]}"
+        )
+        _stop_loss = self.stop_loss_perc*100
+        for s in self._to_set_stop_loss:
+            contract = self.ib_app.get_contract(symbol=s['symbol'])
+            sell_order = self.ib_app.create_order(
+                action='SELL',
+                quantity=s['shares_cnt'],
+                orderType='TRAIL',
+                trailingPercent=_stop_loss,
+            )
+            self.ib_app.placeOrder(self.ib_app.nextOrderId(), contract, sell_order)
+            self.log.debug(
+                f"Placed protective sell Stop Loss ({_stop_loss}%) order for "
+                f"{s['shares_cnt']} shares of {s['symbol']}"
+            )
+
+    def _place_and_monitor_sell_buy(self, to_buy, to_sell, buy_candidates, last_signals_ds):
+        """
+        Input:
+            to_buy: filtered list of candidates to buy (check struct in position sizer)
+            to_sell: list of symbols
+            buy_candidates: list of all candidates to buy
+            last_signals_ds: YYYY-MM-DD str indicating ds to use
+        
+        High-level flow:
+            - This method is executed in loop until to_buy and to_sell are empty
+            - At first it takes currently opened orders to filter out symbols from to_buy/sell
+              so that same orders are not placed twice in case order is still not filled
+            - Then it closes positions from to_sell (send SELL ordedrs)
+            - Then opens positions from to_buy (BUY orders + protective SELL orders with Stop Loss)
+            - Waits a while for orders to fill (those are market orders so expecting relatively
+              fast fill time)
+            - After that, update account details so that money and positions are up to date
+            - Then is defines more things to buy. There should be more money comming from sold
+              things. This can be used to buy more.
+            - At the end, to_buy/to_sell should be up to date so that next iteration is ok 
+        """
+        # Get currently opened orders
+        opened_orders = self.ib_app.get_current_orders()
+        while opened_orders == None:
+            self.log.debug('Could not get opened orderes. Wait 1min and trying again.')
+            time.sleep(60)
+            opened_orders = self.ib_app.get_current_orders()
+        
+        # Check all the current orders and update to_buy/to_sell lists accordingly
+        # [{'symbol': s1, ...}, ...] -> {s1: 0, ...}
+        to_buy_sym_idx_map = {s: idx for idx, s in enumerate([tb['symbol'] for tb in to_buy])}
+        # [s1, s2, ...] -> {s1: 0, s2: 1, ...}
+        to_sell_sym_idx_map = {s: idx for idx, s in enumerate(to_sell)}
+        _opened_buy_symbols = []
+        _protective_to_cancel = {}
+        # (if there are opened orders already -> apporiatly remove elements from lists)
+        for order_id in opened_orders['orders']:
+            _order = opened_orders[order_id]
+            _symbol = _order['symbol']
+            # as all order statuses (e.g. Submitted or Filled) are relevant - there is no check
+            if _order['action'] == 'BUY':
+                if _symbol in to_buy_sym_idx_map.keys():
+                    to_buy.pop(to_buy_sym_idx_map[_symbol])
+                    _opened_buy_symbols.append(_symbol)
+            elif _order['action'] == 'SELL':
+                # check if symbol is on the to sell list and its not protective SL order
+                if (_symbol in to_sell) and (_order['orderType'] == 'MKT'):
+                    to_sell.pop(to_sell_sym_idx_map[_symbol])
+                # get protective SL orders that should be cancelled while selling
+                elif (_symbol in to_sell) and (_order['orderType'] == 'TRAIL'):
+                    _protective_to_cancel[order_id] = _symbol
+
+        self.log.debug(
+            f"There are orders opened for following symbols right now: {_opened_buy_symbols}"
+        )
+        # At this point to_buy/to_sell lists are aware about currently placed orders
+
+        # Place sell orders for held symbols that should be closed
+        self._execute_exit_signals(to_sell, _protective_to_cancel)
+
+        # Place BUY orders and simultaneous protective TRAILING STOP LOSS orders
+        self._execute_entry_signals(to_buy)
+
+        # Give time for trading execution, update portfolio status, place subsequent orders
+        self.log.debug('Sleep for 2mins to give placed (if any) orders some time')
+        time.sleep(120)
+        
+        # Update account details (this will make available_cash and hold_symbols up-to-date)
+        self.account_details = self.get_account_details()
+
+        # Compare hold positions to those which supposed to be sold. Update to_sell
+        # (New to_sell should be an intersection of held and to_sell)
+        to_sell = list(set(self.hold_symbols).intersection(set(to_sell)))
+        self.log.debug(f'Remaining symbols to sell: {to_sell}')
+
+        # If there were things sold, then it is possible that you have more money to buy
+        # Look again at candidates (exclude to_buy for which there were already orders sent)
+        more_buy_candidates = [
+            c for c in buy_candidates
+            if c['symbol'] not in ([tb['symbol'] for tb in to_buy] + _opened_buy_symbols)
+        ]
+        self.log.debug(f'More possible candidates to BUY: {more_buy_candidates}')
+        more_to_buy = self.position_sizer.decide_what_to_buy(
+            self.available_cash,
+            more_buy_candidates,
+            volatility={
+                c['symbol']: self.signals[c['symbol']]['volatility'][last_signals_ds] 
+                for c in more_buy_candidates
+            }
+        )
+        self.log.debug(f'Adding {more_to_buy} to the list of things to BUY')
+        # Update list of shares to buy to include new symbols and exclude those already bought
+        to_buy.extend(more_to_buy)
+        to_buy = [tb for tb in to_buy if tb['symbol'] not in self.hold_symbols]
+        self.log.debug(f'End of execution cycle: to_buy: {to_buy}, to_sell: {to_sell}')
+        return to_buy, to_sell
 
     def _check_ib_env(self):
         # TODO: Implement. This should be additional check for test/prod account 
@@ -302,13 +482,23 @@ class TradingExecutor():
 
 def main(download_data=True, ib_port=None, debug=False, ignore_xe_check=False, 
          ignore_tod_check=False, ignore_sa_check=False, lookback=None):
+    position_sizer = FixedRisk(
+        fee_perc = 0,
+        min_fee = 6*100,
+        sort_type = 'rrr',
+        risk_per_trade = 125*100,
+        debug=debug,
+        allow_partial=True,
+    )
     executor = TradingExecutor(
         pricing_data_path='/Users/slaw/osobiste/trading/pricing_data',
         load_csv=download_data,
+        position_sizer=position_sizer,
         signal_config=long_only_s4_config,
         signal_lookback=lookback,
         ib_port=ib_port,
         debug=debug,
+        stop_loss_perc=1.5,
     )
     executor.trade(
         ignore_xe_check=ignore_xe_check,
@@ -368,22 +558,3 @@ if __name__ == '__main__':
         ignore_tod_check=args.ignore_tod_check,
         ignore_sa_check=args.ignore_sa_check,
     )
-
-
-"""
-example signals[symbol] dataframe
-
-open   high     low  close     volume         obv  entry_long  exit_long  entry_short  exit_short  position
-date                                                                                                                    
-2020-08-06  608.6  614.8  595.80  610.0  1684018.0  -1684018.0         0.0        0.0          0.0         0.0         0
-2020-08-07  607.6  616.8  602.00  611.8  1382306.0   -301712.0         0.0        0.0          0.0         0.0         0
-2020-08-10  618.6  630.0  612.80  620.6  2190978.0   1889266.0         0.0        0.0          0.0         0.0         0
-2020-08-11  626.2  646.0  626.00  644.2  2867888.0   4757154.0         0.0        0.0          0.0         0.0         0
-2020-08-12  642.8  657.4  638.36  644.8  2556613.0   7313767.0         0.0        0.0          0.0         0.0         0
-...           ...    ...     ...    ...        ...         ...         ...        ...          ...         ...       ...
-2020-12-18  821.2  826.2  811.60  814.0  4888155.0  36496095.0         0.0        0.0          0.0         0.0         1
-2020-12-21  794.0  796.0  772.20  787.4  3221088.0  33275007.0         0.0        0.0          0.0         0.0         1
-2020-12-22  784.6  799.0  778.20  796.6  1766023.0  35041030.0         0.0        0.0          0.0         0.0         1
-2020-12-23  794.0  813.8  791.80  812.4  1273175.0  36314205.0         0.0        0.0          0.0         0.0         1
-2020-12-24  812.4  819.8  805.60  813.0   675017.0  36989222.0         0.0        0.0          0.0         0.0         1
-"""

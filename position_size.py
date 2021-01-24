@@ -27,6 +27,7 @@ class PositionSize(metaclass=ABCMeta):
 
     @abstractmethod
     def decide_what_to_buy(self, available_money_at_time, candidates, **kwargs):
+        """ Should use _define_symbol_to_buy in output """
         pass
 
     def calculate_fee(self, transaction_value):
@@ -207,10 +208,14 @@ class FixedRisk(PositionSize):
     There will be always fixed risk per position. E.g. $100 (`risk_per_trade` parameter). Requires stop loss.
     Also, it support RRR (reward-to-risk ratio) sorting. RRR = total_risk / total_gain
     total_risk == risk_per_trade and total_gain = (shares_count * volatility)
+    If allow_partial is True is will allow to be as much as possible in case there is not enough money. Eg.
+    if with given risk_per_trade you should but 10 share but there is money only for 6 - return those 6. By 
+    default is all or nothing. 
     """
-    def __init__(self, risk_per_trade=None, **kwargs):
+    def __init__(self, risk_per_trade=None, allow_partial=False, **kwargs):
         super().__init__(**kwargs)
         self.risk_per_trade = risk_per_trade
+        self.allow_partial = allow_partial
 
     def decide_what_to_buy(self, available_money_at_time, candidates, volatility={}, **kwargs):
         # go over all candidates first time
@@ -223,15 +228,25 @@ class FixedRisk(PositionSize):
             value_at_risk_per_share = abs(price - stop_loss)
             theoretical_trx_value = (self.risk_per_trade//value_at_risk_per_share) * price
             if available_money_at_time < theoretical_trx_value:
-                continue
+                # Implement here allow_partial fill
+                if self.allow_partial == True:
+                    # -1 as safety guard
+                    shares_count = self.get_shares_count(available_money_at_time, price) - 1
+                    self.log.debug(f'Partial order from Position Sizer: {sym}:{shares_count}')
+                else:
+                    self.log.debug((
+                        f'Not enough money to fully buy {sym}. '
+                        f'Need: {theoretical_trx_value}, have: {available_money_at_time}'
+                    ))
+                    continue
             else:
                 shares_count = self.get_shares_count(theoretical_trx_value, price)
-                gain_per_trade = shares_count*volatility.get(sym, 0)
-                # assumes that price can rise/fall curr_price +- 1std
-                if gain_per_trade > 0:
-                    rrrs[sym] = self.risk_per_trade / gain_per_trade
-                else:
-                    rrrs[sym] = 1
+            gain_per_trade = shares_count*volatility.get(sym, 0)
+            # assumes that price can rise/fall curr_price +- 1std
+            if gain_per_trade > 0:
+                rrrs[sym] = self.risk_per_trade / gain_per_trade
+            else:
+                rrrs[sym] = 1
             if shares_count == 0:
                 continue
             real_trx_value = shares_count*price
@@ -242,6 +257,7 @@ class FixedRisk(PositionSize):
         for candidate in self.sort(all_candidates_processed, volatility=volatility, rrr=rrrs):
             remaining_money = available_money_at_time - (candidate['trx_value'] + candidate['fee'])
             if remaining_money > 0:
+                self._buying_decision_msg(candidate['shares_count'], candidate['symbol'])
                 symbols_to_buy.append(candidate)
                 available_money_at_time = remaining_money
             else:
